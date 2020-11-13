@@ -4,12 +4,11 @@
 #include <iostream>
 #include <Eigen/Eigen>
 
-#include <common/mavlink.h>
+#include <sysu/mavlink.h>
 
 #include "generic_port.h"
 #include "serial_port.h"
 #include "udp_port.h"
-#include "autopilot_interface.h"
 #include "math_utils.h"
 #include "mavlink_aes.c"
 #include <signal.h>
@@ -66,38 +65,108 @@ Eigen::Quaterniond q_gazebo;
 Eigen::Vector3d Euler_gazebo;   
 geometry_msgs::Point setpoint;
 //>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>函数声明<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-void read_messages(Autopilot_Interface &api);
-void send_messages(Autopilot_Interface &api);
+void handle_msg(const mavlink_message_t* msg);
 //>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>回调函数<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-void gazebo_cb(const nav_msgs::Odometry::ConstPtr& msg, Generic_Port *port)
-{
-    q_gazebo = Eigen::Quaterniond(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
-    Euler_gazebo = quaternion_to_euler(q_gazebo);
-    
-    
-    // NED frame
-    mavlink_vision_position_estimate_t pose_vision = { 0 };
-    ros::Time stamp = ros::Time::now();
-    pose_vision.usec = stamp.toNSec() / 1000;
-    pose_vision.x = msg->pose.pose.position.x;
-    pose_vision.y = - msg->pose.pose.position.y;
-    pose_vision.z = - msg->pose.pose.position.z;
-    pose_vision.roll = Euler_gazebo[0];
-    pose_vision.pitch = Euler_gazebo[1];
-    pose_vision.yaw = -Euler_gazebo[2];
-    //pose_vision.covariance = { 0 };
 
-    mavlink_message_t message;
-    mavlink_msg_vision_position_estimate_encode(system_id, component_id, &message, &pose_vision);
-
-    int len = port->write_message(message);
-}
 void sp_cb(const geometry_msgs::Point::ConstPtr& msg)
 {
     setpoint = *msg;
     printf("Got a new setpoint \n");
     printf("    setpoint  (NED):  % f % f % f (m/s^2)\n", setpoint.x , setpoint.y , setpoint.z );
 }
+
+void timerCallback1(const ros::TimerEvent& e, Generic_Port *port)
+{
+    // 收到飞控发来的数据，将其存储为对应的 mavlink 消息
+    mavlink_cm_zdfx_t cm_zdfx_plain = { 0 };
+    //　声明一个密文结构体
+    mavlink_cm_zdfx_t cm_zdfx_cipher = { 0 };
+
+    cm_zdfx_plain.head[0] = '$';
+    cm_zdfx_plain.head[1] = 'C';
+    cm_zdfx_plain.head[2] = 'M';
+    cm_zdfx_plain.msg_id = 1;
+    cm_zdfx_plain.uav_id = 0;
+    cm_zdfx_plain.length = 10 + 8;
+    cm_zdfx_plain.checksum = 0.0;
+
+    cm_zdfx_plain.WP_lat = 0;
+    cm_zdfx_plain.WP_lon  = 4;
+    cm_zdfx_plain.WP_alt = 8;
+
+    // 明文加密，使用AES算法
+
+    // 初始化
+    //256 bit密码
+	BYTE key[1][32] = 
+    {
+		{0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4}
+	};
+    WORD key_schedule[60];
+	BYTE iv[1][16] = 
+    {
+		{0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff},
+	};
+    BYTE plaintext[1][MAVLINK_MSG_ID_DN_FXSJ_LEN];
+	BYTE enc_buf[MAVLINK_MSG_ID_DN_FXSJ_LEN];
+
+    // 设置密钥
+	aes_key_setup(key[0], key_schedule, 256);
+
+	// printf(  "Key          : ");
+	// print_hex(key[0], 32);
+	// printf("\nIV           : ");
+	// print_hex(iv[0], 16);
+
+    // 将mavlink payload结构体转为明文
+    memcpy(&plaintext, &cm_zdfx_plain, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+
+    // 使用AES算法加密，并将密文存储到enc_buf中
+	aes_encrypt_ctr(plaintext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN, enc_buf, key_schedule, 256, iv[0]);
+	// printf("\nPlaintext    : ");
+	// print_hex(plaintext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN);
+	// printf("\n-encrypted to: ");
+	// print_hex(enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+    // printf("\n\n");
+
+    //　将enc_buf转为cm_zdfx_cipher
+    memcpy(&cm_zdfx_cipher, &enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+
+    // 将加密后的密文编码为mavlink_message标准结构体
+    mavlink_message_t* msg;
+    mavlink_message_t message;
+    int	system_id    = 1; // system id
+    int	component_id = 1; // component id
+    mavlink_msg_cm_zdfx_encode(system_id, component_id, &message, &cm_zdfx_cipher);
+
+    // 发送
+    int len = port->write_message(message);
+
+
+    printf("Sending message CM_ZDFX \n");
+    printf("    magic:          %02X    \n", message.magic );
+    printf("    len:            %02X    \n", message.len );
+    printf("    incompat_flags: %02X    \n", message.incompat_flags );
+    printf("    compat_flags:   %02X    \n", message.compat_flags );
+    printf("    seq:            %02X    \n", message.seq );
+    printf("    sysid:          %02X    \n", message.sysid );
+    printf("    compid:         %02X    \n", message.compid );
+    printf("    msgid:          %02X    \n", message.msgid );
+    printf("    ckecksum:       %02X-%02X    \n", message.ck[0],message.ck[1] );
+    printf("    link id:        %02X    \n", message.signature[0] );
+    printf("    time stamp:     %02X-%02X-%02X-%02X-%02X-%02X    \n", message.signature[1], message.signature[2], message.signature[3], message.signature[4], message.signature[5], message.signature[6] );
+    printf("    signature:      %02X-%02X-%02X-%02X-%02X-%02X    \n", message.signature[7], message.signature[8], message.signature[9], message.signature[10], message.signature[11], message.signature[12] );
+    printf("    payload_cipher:   \n" );
+    printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:   %s  %d %d %d %d      \n", cm_zdfx_cipher.head, cm_zdfx_cipher.msg_id, cm_zdfx_cipher.uav_id, cm_zdfx_cipher.length, cm_zdfx_cipher.checksum );
+    printf("    WP_lat, WP_lon, WP_alt:    %d %d %d                      \n", cm_zdfx_cipher.WP_lat, cm_zdfx_cipher.WP_lon, cm_zdfx_cipher.WP_alt );
+    printf("    payload_plain:   \n" );
+    printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:     %s  %d %d %d %d    \n", cm_zdfx_plain.head, cm_zdfx_plain.msg_id, cm_zdfx_plain.uav_id, cm_zdfx_plain.length, cm_zdfx_plain.checksum );
+    printf("    WP_lat, WP_lon, WP_alt:    %d %d %d                      \n", cm_zdfx_plain.WP_lat, cm_zdfx_plain.WP_lon, cm_zdfx_plain.WP_alt );
+    printf("\n");
+}
+
+
+
 //>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>主 函 数<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 int main(int argc, char **argv)
 {
@@ -129,20 +198,14 @@ int main(int argc, char **argv)
 		port = new Serial_Port(uart_name_adr, baudrate);
 	}
 
-	//Instantiate an autopilot interface object
-    //Autopilot_Interface autopilot_interface(port);
-
-	/*
-	 * Start the port and autopilot_interface
-	 * This is where the port is opened, and read and write threads are started.
-	 */
 	port->start();
-	//autopilot_interface.start();
 
     //至此初始化结束，缺省了关闭串口的初始化
 
-    //ros::Subscriber gazebo_sub = nh.subscribe<nav_msgs::Odometry>("/prometheus/ground_truth/p300_basic", 100, boost::bind(&gazebo_cb,_1,port));
     ros::Subscriber sp_sub = nh.subscribe<geometry_msgs::Point>("/setpoint", 100, sp_cb);
+
+    // 定时发送
+    // ros::Timer timer1 = nh.createTimer(ros::Duration(1.0), boost::bind(&timerCallback1,_1,port));
 
     //初始起飞点
     setpoint.x = 0.0;
@@ -152,14 +215,17 @@ int main(int argc, char **argv)
     // 频率
     ros::Rate rate(10.0);
 
+    // 读取到的消息
+    mavlink_message_t message_received;
+
     //密钥初始化及读取
     memset(&signing, 0, sizeof(signing));
     memcpy(signing.secret_key, secret_key_ground, 32);
 
-
     //签名stream初始化
     memset(&signing_streams, 0, sizeof(signing_streams));
     signing_streams.num_signing_streams = 0;
+
 //     signing_streams.stream
     
 // typedef struct __mavlink_signing_streams {
@@ -173,151 +239,187 @@ int main(int argc, char **argv)
 // } mavlink_signing_streams_t;
     while(ros::ok())
     {
-        // send_messages(autopilot_interface);
-        // read_messages(autopilot_interface);
-        bool success;               // receive success flag
-
-        mavlink_message_t message;
-        success = port->read_message(message);
+        bool success = port->read_message(message_received);
 
 		if( success )
 		{
-			// Handle Message ID
-			switch (message.msgid)
-			{
-				case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
-				{
-                    mavlink_local_position_ned_t local_position_ned_cipher;
-                    mavlink_local_position_ned_t local_position_ned_plain = { 0 };
-					mavlink_msg_local_position_ned_decode(&message, &(local_position_ned_cipher));
+            handle_msg(&message_received);
 
-                    // 初始化
-                    //256 bit密码
-                    BYTE key[1][32] = {
-                        {0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4}
-                    };
-                    WORD key_schedule[60];
-                    BYTE iv[1][16] = {
-                        {0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff},
-                    };
-                    BYTE ciphertext[1][MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN];
-                    BYTE enc_buf[MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN];
-                    
-                    // 设置密钥
-                    aes_key_setup(key[0], key_schedule, 256);
-                    // 将mavlink payload结构体转为密文
-                    memcpy(&ciphertext, &local_position_ned_cipher, MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN);
-                    //解密
-                    aes_decrypt_ctr(ciphertext[0], MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN, enc_buf, key_schedule, 256, iv[0]);
-                    // printf("\nCiphertext   : ");
-                    // print_hex(ciphertext[0], MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN);
-                    // printf("\n-decrypted to: ");
-                    // print_hex(enc_buf, MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN);
-
-                    memcpy(&local_position_ned_plain, &enc_buf, MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN);
-                    //pass = pass && !memcmp(enc_buf, plaintext[0], MAVLINK_MSG_ID_LOCAL_POSITION_NED_LEN);
-                    
-                    printf("Got message LOCAL_POSITION_NED \n");
-                    printf("    magic:          %02X    \n", message.magic );
-                    printf("    len:            %02X    \n", message.len );
-                    printf("    incompat_flags: %02X    \n", message.incompat_flags );
-                    printf("    compat_flags:   %02X    \n", message.compat_flags );
-                    printf("    seq:            %02X    \n", message.seq );
-                    printf("    sysid:          %02X    \n", message.sysid );
-                    printf("    compid:         %02X    \n", message.compid );
-                    printf("    msgid:          %02X    \n", message.msgid );
-                    printf("    ckecksum:       %02X-%02X    \n", message.ck[0],message.ck[1] );
-                    printf("    link id:        %02X    \n", message.signature[0] );
-                    printf("    time stamp:     %02X-%02X-%02X-%02X-%02X-%02X    \n", message.signature[1], message.signature[2], message.signature[3], message.signature[4], message.signature[5], message.signature[6] );
-                    printf("    signature:      %02X-%02X-%02X-%02X-%02X-%02X    \n", message.signature[7], message.signature[8], message.signature[9], message.signature[10], message.signature[11], message.signature[12] );
-                    printf("    payload_cipher:   \n" );
-                    printf("    time_in_msg:    %u       (ms)\n", local_position_ned_cipher.time_boot_ms );
-                    printf("    pos  (NED):     %f %f %f (m)\n", local_position_ned_cipher.x, local_position_ned_cipher.y, local_position_ned_cipher.z );
-                    printf("    vel  (NED):     %f %f %f (m/s)\n", local_position_ned_cipher.vx, local_position_ned_cipher.vy, local_position_ned_cipher.vz );
-                    printf("    payload_plain:   \n" );
-                    printf("    time_in_msg:    %u       (ms)\n", local_position_ned_plain.time_boot_ms );
-                    printf("    pos  (NED):     %f %f %f (m)\n", local_position_ned_plain.x, local_position_ned_plain.y, local_position_ned_plain.z );
-                    printf("    vel  (NED):     %f %f %f (m/s)\n", local_position_ned_plain.vx, local_position_ned_plain.vy, local_position_ned_plain.vz );
-                    printf("\n");
-
-                    uint64_t timestamp_test = get_time_msec();
-	                signing.timestamp = timestamp_test; 
-
-                    bool check_signature = mavlink_signature_check(&signing, &signing_streams,&message);
-
-                    if(check_signature)
-                    {
-                        printf("check_signature pass ! \n");
-                    }else
-                    {
-                        printf("check_signature not pass ! \n");
-                    }
-                    
-
-					break;
-				}
-            }
         }else
         {
-            //printf("No message !!! \n");
+            printf("No message !!! \n");
         }
-        
-
-        //回调一次 更新传感器状态
+        //回调一次 
         //ros::spinOnce();
         usleep(100);
-        //rate.sleep();
     }
 
     return 0;
 
 }
 
-void send_messages(Autopilot_Interface &api)
+void handle_msg(const mavlink_message_t* msg)
 {
-	printf("SEND OFFBOARD COMMANDS\n");
+    // Handle Message ID
+    switch (msg->msgid)
+    {
+        case MAVLINK_MSG_ID_DN_FXSJ:
+        {
+            mavlink_dn_fxsj_t dn_fxsj_cipher = { 0 };
+            mavlink_dn_fxsj_t dn_fxsj_plain  = { 0 };
+            mavlink_msg_dn_fxsj_decode( msg, &dn_fxsj_cipher);
 
-	// initialize command data strtuctures
-	mavlink_set_position_target_local_ned_t sp;
-	mavlink_set_position_target_local_ned_t ip = api.initial_position;
+            // 初始化
+            //256 bit密码
+            BYTE key[1][32] = 
+            {
+                {0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4}
+            };
+            WORD key_schedule[60];
+            BYTE iv[1][16] = 
+            {
+                {0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff},
+            };
+            BYTE ciphertext[1][MAVLINK_MSG_ID_DN_FXSJ_LEN];
+            BYTE enc_buf[MAVLINK_MSG_ID_DN_FXSJ_LEN];
+            
+            // 设置密钥
+            aes_key_setup(key[0], key_schedule, 256);
+            // 将mavlink payload结构体转为密文
+            memcpy(&ciphertext, &dn_fxsj_cipher, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            //解密，此处key_schedule为秘钥
+            aes_decrypt_ctr(ciphertext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN, enc_buf, key_schedule, 256, iv[0]);
+            // printf("\nCiphertext   : ");
+            // print_hex(ciphertext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            // printf("\n-decrypted to: ");
+            // print_hex(enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
 
-	sp.coordinate_frame = MAV_FRAME_LOCAL_NED;
-    sp.type_mask = 0b100111111000;  // 100 111 111 000  xyz + yaw
+            memcpy(&dn_fxsj_plain, &enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            //pass = pass && !memcmp(enc_buf, plaintext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            
+            printf("Got msg DN_FXSJ \n");
+            printf("    magic:          %02X    \n", msg->magic );
+            printf("    len:            %02X    \n", msg->len );
+            printf("    incompat_flags: %02X    \n", msg->incompat_flags );
+            printf("    compat_flags:   %02X    \n", msg->compat_flags );
+            printf("    seq:            %02X    \n", msg->seq );
+            printf("    sysid:          %02X    \n", msg->sysid );
+            printf("    compid:         %02X    \n", msg->compid );
+            printf("    msgid:          %02X    \n", msg->msgid );
+            printf("    ckecksum:       %02X-%02X    \n", msg->ck[0],msg->ck[1] );
+            printf("    link id:        %02X    \n", msg->signature[0] );
+            printf("    time stamp:     %02X-%02X-%02X-%02X-%02X-%02X    \n", msg->signature[1], msg->signature[2], msg->signature[3], msg->signature[4], msg->signature[5], msg->signature[6] );
+            printf("    signature:      %02X-%02X-%02X-%02X-%02X-%02X    \n", msg->signature[7], msg->signature[8], msg->signature[9], msg->signature[10], msg->signature[11], msg->signature[12] );
+            printf("    payload_cipher:   \n" );
+            printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:   %s  %d %d %d %d      \n", dn_fxsj_cipher.head, dn_fxsj_cipher.msg_id, dn_fxsj_cipher.uav_id, dn_fxsj_cipher.length, dn_fxsj_cipher.checksum );
+            printf("    GPS_lat, GPS_lon, GPS_alt:    %d %d %d                      \n", dn_fxsj_cipher.GPS_lat, dn_fxsj_cipher.GPS_lon, dn_fxsj_cipher.GPS_alt );
+            printf("    GPS_Vn, GPS_Ve :    %d %d                                   \n", dn_fxsj_cipher.GPS_Vn, dn_fxsj_cipher.GPS_Ve );
+            printf("    GPS_num, GPS_time, GPS_sec :    %d %d %d                    \n", dn_fxsj_cipher.GPS_num, dn_fxsj_cipher.GPS_time, dn_fxsj_cipher.GPS_sec );
+            printf("    pos  (NED):     %d %d %d (cm)                               \n", dn_fxsj_cipher.x, dn_fxsj_cipher.y, dn_fxsj_cipher.z );
+            printf("    vel  (NED):     %d %d %d (cm/s)                             \n", dn_fxsj_cipher.vx, dn_fxsj_cipher.vy, dn_fxsj_cipher.vz );
+            printf("    acc  (NED):     %d %d %d (cm/s^2)                           \n", dn_fxsj_cipher.ax, dn_fxsj_cipher.ay, dn_fxsj_cipher.az );
+            printf("    angle     :     %d %d %d (degree)                           \n", dn_fxsj_cipher.pitch, dn_fxsj_cipher.roll, dn_fxsj_cipher.yaw );
+            printf("    acc_vibe, gyro_vibe :    %d %d                              \n", dn_fxsj_cipher.acc_vibe, dn_fxsj_cipher.gyro_vibe );
+            printf("    payload_plain:   \n" );
+            printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:     %s  %d %d %d %d    \n", dn_fxsj_plain.head, dn_fxsj_plain.msg_id, dn_fxsj_plain.uav_id, dn_fxsj_plain.length, dn_fxsj_plain.checksum );
+            printf("    GPS_lat, GPS_lon, GPS_alt:    %d %d %d                      \n", dn_fxsj_plain.GPS_lat, dn_fxsj_plain.GPS_lon, dn_fxsj_plain.GPS_alt );
+            printf("    GPS_Vn, GPS_Ve :    %d %d                                   \n", dn_fxsj_plain.GPS_Vn, dn_fxsj_plain.GPS_Ve );
+            printf("    GPS_num, GPS_time, GPS_sec :    %d %d %d                    \n", dn_fxsj_plain.GPS_num, dn_fxsj_plain.GPS_time, dn_fxsj_plain.GPS_sec );
+            printf("    pos  (NED):     %d %d %d (cm)                               \n", dn_fxsj_plain.x, dn_fxsj_plain.y, dn_fxsj_plain.z );
+            printf("    vel  (NED):     %d %d %d (cm/s)                             \n", dn_fxsj_plain.vx, dn_fxsj_plain.vy, dn_fxsj_plain.vz );
+            printf("    acc  (NED):     %d %d %d (cm/s^2)                           \n", dn_fxsj_plain.ax, dn_fxsj_plain.ay, dn_fxsj_plain.az );
+            printf("    angle     :     %d %d %d (degree)                           \n", dn_fxsj_plain.pitch, dn_fxsj_plain.roll, dn_fxsj_plain.yaw );
+            printf("    acc_vibe, gyro_vibe :    %d %d                              \n", dn_fxsj_plain.acc_vibe, dn_fxsj_plain.gyro_vibe );
+            printf("\n");
 
-	sp.x   = setpoint.x;
-	sp.y   = setpoint.y;
-	sp.z   = setpoint.z;
-    sp.yaw = 0.0;
+            uint64_t timestamp_test = get_time_msec();
+            signing.timestamp = timestamp_test; 
 
-	// SEND THE COMMAND , 这里调用的是Autopilot_Interface的子函数，Autopilot_Interface会负责持续发送这个消息到飞控
-	api.update_setpoint(sp);
-}
+            bool check_signature = mavlink_signature_check(&signing, &signing_streams, msg);
 
-void read_messages(Autopilot_Interface &api)
-{
-    printf("READ SOME MESSAGES \n");
+            if(check_signature)
+            {
+                printf("check_signature pass ! \n");
+            }else
+            {
+                printf("check_signature not pass ! \n");
+            }
+            
 
-    // copy current messages
-    Mavlink_Messages messages = api.current_messages;
+            break;
+        }
 
-    // local position in ned frame
-    mavlink_local_position_ned_t pos = messages.local_position_ned;
-    printf("Got message LOCAL_POSITION_NED \n");
-    printf("    time_in_msg:    %u    (ms)\n", pos.time_boot_ms );
-    printf("    time_in_local:  %u    (ms)\n", (uint32_t)(messages.time_stamps.local_position_ned/1000));
-    printf("    pos  (NED):  %f %f %f (m)\n", pos.x, pos.y, pos.z );
 
-    // hires imu
-    mavlink_highres_imu_t imu = messages.highres_imu;
-    printf("Got message HIGHRES_IMU \n");
-    printf("    time_in_msg:     %lu  (us)\n", imu.time_usec);
-    printf("    time_in_local:   %lu  (us)\n", messages.time_stamps.highres_imu );
-    printf("    acc  (NED):  % f % f % f (m/s^2)\n", imu.xacc , imu.yacc , imu.zacc );
-    printf("    gyro (NED):  % f % f % f (rad/s)\n", imu.xgyro, imu.ygyro, imu.zgyro);
-    printf("    mag  (NED):  % f % f % f (Ga)\n"   , imu.xmag , imu.ymag , imu.zmag );
-    printf("    baro:        %f (mBar) \n"  , imu.abs_pressure);
-    printf("    altitude:    %f (m) \n"     , imu.pressure_alt);
-    printf("    temperature: %f C \n"       , imu.temperature );
+        case MAVLINK_MSG_ID_CM_ZDFX:
+        {
+            mavlink_cm_zdfx_t cm_zdfx_cipher = { 0 };
+            mavlink_cm_zdfx_t cm_zdfx_plain  = { 0 };
+            mavlink_msg_cm_zdfx_decode( msg, &cm_zdfx_cipher);
 
-    printf("\n");
+            // 初始化
+            //256 bit密码
+            BYTE key[1][32] = 
+            {
+                {0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4}
+            };
+            WORD key_schedule[60];
+            BYTE iv[1][16] = 
+            {
+                {0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff},
+            };
+            BYTE ciphertext[1][MAVLINK_MSG_ID_DN_FXSJ_LEN];
+            BYTE enc_buf[MAVLINK_MSG_ID_DN_FXSJ_LEN];
+            
+            // 设置密钥
+            aes_key_setup(key[0], key_schedule, 256);
+            // 将mavlink payload结构体转为密文
+            memcpy(&ciphertext, &cm_zdfx_cipher, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            //解密
+            aes_decrypt_ctr(ciphertext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN, enc_buf, key_schedule, 256, iv[0]);
+            // printf("\nCiphertext   : ");
+            // print_hex(ciphertext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            // printf("\n-decrypted to: ");
+            // print_hex(enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+
+            memcpy(&cm_zdfx_plain, &enc_buf, MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            //pass = pass && !memcmp(enc_buf, plaintext[0], MAVLINK_MSG_ID_DN_FXSJ_LEN);
+            
+            printf("Got msg CM_ZDFX \n");
+            printf("    magic:          %02X    \n", msg->magic );
+            printf("    len:            %02X    \n", msg->len );
+            printf("    incompat_flags: %02X    \n", msg->incompat_flags );
+            printf("    compat_flags:   %02X    \n", msg->compat_flags );
+            printf("    seq:            %02X    \n", msg->seq );
+            printf("    sysid:          %02X    \n", msg->sysid );
+            printf("    compid:         %02X    \n", msg->compid );
+            printf("    msgid:          %02X    \n", msg->msgid );
+            printf("    ckecksum:       %02X-%02X    \n", msg->ck[0],msg->ck[1] );
+            printf("    link id:        %02X    \n", msg->signature[0] );
+            printf("    time stamp:     %02X-%02X-%02X-%02X-%02X-%02X    \n", msg->signature[1], msg->signature[2], msg->signature[3], msg->signature[4], msg->signature[5], msg->signature[6] );
+            printf("    signature:      %02X-%02X-%02X-%02X-%02X-%02X    \n", msg->signature[7], msg->signature[8], msg->signature[9], msg->signature[10], msg->signature[11], msg->signature[12] );
+            printf("    payload_cipher:   \n" );
+            printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:   %s  %d %d %d %d      \n", cm_zdfx_cipher.head, cm_zdfx_cipher.msg_id, cm_zdfx_cipher.uav_id, cm_zdfx_cipher.length, cm_zdfx_cipher.checksum );
+            printf("    WP_lat, WP_lon, WP_alt:    %d %d %d                      \n", cm_zdfx_cipher.WP_lat, cm_zdfx_cipher.WP_lon, cm_zdfx_cipher.WP_alt );
+            printf("    payload_plain:   \n" );
+            printf("    HEAD, MSG_ID, UAV_ID, LEN, Checksum:     %s  %d %d %d %d    \n", cm_zdfx_plain.head, cm_zdfx_plain.msg_id, cm_zdfx_plain.uav_id, cm_zdfx_plain.length, cm_zdfx_plain.checksum );
+            printf("    WP_lat, WP_lon, WP_alt:    %d %d %d                      \n", cm_zdfx_plain.WP_lat, cm_zdfx_plain.WP_lon, cm_zdfx_plain.WP_alt );
+            printf("\n");
+
+            uint64_t timestamp_test = get_time_msec();
+            signing.timestamp = timestamp_test; 
+
+            bool check_signature = mavlink_signature_check(&signing, &signing_streams, msg);
+
+            if(check_signature)
+            {
+                printf("check_signature pass ! \n");
+            }else
+            {
+                printf("check_signature not pass ! \n");
+            }
+            
+
+            break;
+        }
+    }
 }

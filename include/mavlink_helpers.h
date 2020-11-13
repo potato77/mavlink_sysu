@@ -328,8 +328,20 @@ MAVLINK_HELPER uint16_t mavlink_finalize_message_chan(mavlink_message_t* msg, ui
 	//声明一个签名帧结构体
 	mavlink_signing_t signing;
 	memset(&signing, 0, sizeof(signing));
-	//读取指定秘钥
-	memcpy(signing.secret_key, secret_key_test, 32);
+
+	// 使用component id 作为秘钥选择的标志量
+	if(component_id == 1)
+	{
+		//读取指定秘钥
+		memcpy(signing.secret_key, secret_sign_key_1, 32);
+	}else if(component_id == 2)
+	{
+		memcpy(signing.secret_key, secret_sign_key_2, 32);
+	}else if(component_id == 3)
+	{
+		memcpy(signing.secret_key, secret_sign_key_3, 32);
+	}
+
 	//link id赋值
 	signing.link_id = (uint8_t)chan;
 	//时间戳赋值，单位是ms

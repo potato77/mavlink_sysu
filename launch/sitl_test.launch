@@ -41,7 +41,7 @@
 		args="-sdf -file $(arg sdf) -model $(arg model) -x $(arg x) -y $(arg y) -z $(arg z) -R $(arg R) -P $(arg P) -Y $(arg Y)">
 	</node>
 
-	<node pkg="mavlink_common" type="mavlink_node" name="mavlink_node" output="screen" launch-prefix="gnome-terminal --">
+	<node pkg="mavlink_sysu" type="mavlink_node" name="mavlink_node" output="screen" launch-prefix="gnome-terminal --">
 		<param name="use_udp" value="true" type="bool"/>
 		<param name="uart_name" value="/dev/ttyUSB0" type="string"/>
 		<param name="baudrate" value="57600" type="int"/>
